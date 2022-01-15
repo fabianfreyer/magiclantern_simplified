@@ -1,6 +1,6 @@
 CC=gcc
-CFLAGS=
-LDFLAGS=-lusb
+CFLAGS=$(shell pkg-config --cflags libusb-1.0) -w
+LDFLAGS=$(shell pkg-config --libs libusb-1.0)
 
 all: ptpcam
 

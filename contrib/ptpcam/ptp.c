@@ -146,9 +146,9 @@ ptp_usb_senddata (PTPParams* params, PTPContainer* ptp,
 		params->data);
 	if (ret!=PTP_RC_OK) {
 		ret = PTP_ERROR_IO;
-/*		ptp_error (params,
+		ptp_error (params,
 		"PTP: request code 0x%04x sending data error 0x%04x",
-			ptp->Code,ret);*/
+			ptp->Code,ret);
 		return ret;
 	}
 	if (size<=PTP_USB_BULK_PAYLOAD_LEN) return ret;
@@ -157,9 +157,9 @@ ptp_usb_senddata (PTPParams* params, PTPContainer* ptp,
 				size-PTP_USB_BULK_PAYLOAD_LEN, params->data);
 	if (ret!=PTP_RC_OK) {
 		ret = PTP_ERROR_IO;
-/*		ptp_error (params,
+		ptp_error (params,
 		"PTP: request code 0x%04x sending data error 0x%04x",
-			ptp->Code,ret); */
+			ptp->Code,ret);
 	}
 	return ret;
 }

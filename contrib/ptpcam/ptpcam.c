@@ -35,6 +35,7 @@
 #include <sys/mman.h>
 #endif
 #include <usb.h>
+#include <libusb.h>
 
 #ifdef WIN32
 #define usleep(usec) Sleep((usec)/1000)
@@ -111,6 +112,7 @@ int ptpcam_usb_timeout = USB_TIMEOUT;
 /* we need it for a proper signal handling :/ */
 PTPParams* globalparams;
 
+libusb_context* usb_ctx;
 
 void
 usage()
@@ -194,14 +196,12 @@ void
 ptpcam_siginthandler(int signum)
 {
     PTP_USB* ptp_usb=(PTP_USB *)globalparams->data;
-    struct usb_device *dev=usb_device(ptp_usb->handle);
-
     if (signum==SIGINT)
     {
 	/* hey it's not that easy though... but at least we can try! */
 	printf("Got SIGINT, trying to clean up and close...\n");
 	usleep(5000);
-	close_camera (ptp_usb, globalparams, dev);
+	close_camera (ptp_usb, globalparams, ptp_usb->handle);
 	exit (-1);
     }
 }
@@ -213,6 +213,7 @@ ptp_read_func (unsigned char *bytes, unsigned int size, void *data)
 	PTP_USB *ptp_usb=(PTP_USB *)data;
 	int toread=0;
 	signed long int rbytes=size;
+	int transferred = 0;
 
 	do {
 		bytes+=toread;
@@ -220,10 +221,10 @@ ptp_read_func (unsigned char *bytes, unsigned int size, void *data)
 			toread = PTPCAM_USB_URB;
 		else
 			toread = rbytes;
-		result=USB_BULK_READ(ptp_usb->handle, ptp_usb->inep,(char *)bytes, toread,ptpcam_usb_timeout);
+		result=libusb_bulk_transfer(ptp_usb->handle, ptp_usb->inep, (char *)bytes, toread, &transferred, ptpcam_usb_timeout);
 		/* sometimes retry might help */
 		if (result==0)
-			result=USB_BULK_READ(ptp_usb->handle, ptp_usb->inep,(char *)bytes, toread,ptpcam_usb_timeout);
+			result=libusb_bulk_transfer(ptp_usb->handle, ptp_usb->inep, (char *)bytes, toread, &transferred, ptpcam_usb_timeout);
 		if (result < 0)
 			break;
 		rbytes-=PTPCAM_USB_URB;
@@ -234,7 +235,7 @@ ptp_read_func (unsigned char *bytes, unsigned int size, void *data)
 	}
 	else 
 	{
-		if (verbose) perror("usb_bulk_read");
+		if (verbose) perror("libusb_bulk_transfer");
 		return PTP_ERROR_IO;
 	}
 }
@@ -243,14 +244,17 @@ static short
 ptp_write_func (unsigned char *bytes, unsigned int size, void *data)
 {
 	int result;
+	int transferred;
 	PTP_USB *ptp_usb=(PTP_USB *)data;
-
-	result=USB_BULK_WRITE(ptp_usb->handle,ptp_usb->outep,(char *)bytes,size,ptpcam_usb_timeout);
+	printf(
+		"libusb_bulk_transfer(handle=%x, endpoint=%x)\n", ptp_usb->handle, ptp_usb->outep
+	);
+	result=libusb_bulk_transfer(ptp_usb->handle,ptp_usb->outep,(char *)bytes,size,&transferred,ptpcam_usb_timeout);
 	if (result >= 0)
 		return (PTP_RC_OK);
 	else 
 	{
-		if (verbose) perror("usb_bulk_write");
+		if (verbose) perror("libusb_bulk_transfer");
 		return PTP_ERROR_IO;
 	}
 }
@@ -260,11 +264,13 @@ static short
 ptp_check_int (unsigned char *bytes, unsigned int size, void *data)
 {
 	int result;
+	int transferred = 0;
 	PTP_USB *ptp_usb=(PTP_USB *)data;
 
-	result=USB_BULK_READ(ptp_usb->handle, ptp_usb->intep,(char *)bytes,size,ptpcam_usb_timeout);
+	result=libusb_bulk_transfer(ptp_usb->handle, ptp_usb->intep, (char *)bytes, size, &transferred, ptpcam_usb_timeout);
 	if (result==0)
-	    result=USB_BULK_READ(ptp_usb->handle, ptp_usb->intep,(char *)bytes,size,ptpcam_usb_timeout);
+	    result=libusb_bulk_transfer(ptp_usb->handle, ptp_usb->intep, (char *)bytes, size, &transferred, ptpcam_usb_timeout);
+
 	if (verbose>2) fprintf (stderr, "USB_BULK_READ returned %i, size=%i\n", result, size);
 
 	if (result >= 0) {
@@ -301,9 +307,16 @@ ptpcam_error (void *data, const char *format, va_list args)
 
 
 void
-init_ptp_usb (PTPParams* params, PTP_USB* ptp_usb, struct usb_device* dev)
+init_ptp_usb (PTPParams* params, PTP_USB* ptp_usb, struct libusb_device* dev)
 {
-	usb_dev_handle *device_handle;
+	libusb_device_handle *device_handle;
+	int error;
+	struct libusb_config_descriptor *config = NULL;
+
+	if(libusb_get_config_descriptor(dev, 0, &config) != 0) {
+		perror("libusb_get_config_descriptor");
+		exit(1);
+	}
 
 	params->write_func=ptp_write_func;
 	params->read_func=ptp_read_func;
@@ -319,17 +332,17 @@ init_ptp_usb (PTPParams* params, PTP_USB* ptp_usb, struct usb_device* dev)
 	params->transaction_id=0;
 	params->byteorder = PTP_DL_LE;
 
-	if ((device_handle=usb_open(dev))){
-		if (!device_handle) {
-			perror("usb_open()");
-			exit(0);
-		}
-		ptp_usb->handle=device_handle;
-		usb_set_configuration(device_handle, dev->config->bConfigurationValue);
-		usb_claim_interface(device_handle,
-			dev->config->interface->altsetting->bInterfaceNumber);
+	if ((error=libusb_open(dev, &device_handle))){
+		perror("libusb_open()");
+		exit(0);
 	}
+
+	ptp_usb->handle=device_handle;
+	libusb_set_configuration(device_handle, config->bConfigurationValue);
+	libusb_claim_interface(device_handle, ptp_usb->interface_number);
 	globalparams=params;
+
+	libusb_free_config_descriptor(config);
 }
 
 void
@@ -344,9 +357,8 @@ clear_stall(PTP_USB* ptp_usb)
 	/* and clear the HALT condition if happend */
 	else if (status) {
 		printf("Resetting input pipe!\n");
-		ret=usb_clear_stall_feature(ptp_usb,ptp_usb->inep);
-        	/*usb_clear_halt(ptp_usb->handle,ptp_usb->inep); */
-		if (ret<0)perror ("usb_clear_stall_feature()");
+		ret=libusb_clear_halt(ptp_usb->handle,ptp_usb->inep);
+		if (ret<0)perror ("libusb_clear_halt()");
 	}
 	status=0;
 
@@ -356,114 +368,137 @@ clear_stall(PTP_USB* ptp_usb)
 	/* and clear the HALT condition if happend */
 	else if (status) {
 		printf("Resetting output pipe!\n");
-        	ret=usb_clear_stall_feature(ptp_usb,ptp_usb->outep);
-		/*usb_clear_halt(ptp_usb->handle,ptp_usb->outep); */
-		if (ret<0)perror ("usb_clear_stall_feature()");
+		ret=libusb_clear_halt(ptp_usb->handle,ptp_usb->outep);
+		if (ret<0) perror ("libusb_clear_halt()");
 	}
 
         /*usb_clear_halt(ptp_usb->handle,ptp_usb->intep); */
 }
 
 void
-close_usb(PTP_USB* ptp_usb, struct usb_device* dev)
+close_usb(PTP_USB* ptp_usb)
 {
-	//clear_stall(ptp_usb);
-        usb_release_interface(ptp_usb->handle,
-                dev->config->interface->altsetting->bInterfaceNumber);
-	usb_reset(ptp_usb->handle);
-        usb_close(ptp_usb->handle);
+	printf("closing\n");
+	libusb_release_interface(ptp_usb->handle, ptp_usb->interface_number);
+	libusb_reset_device(ptp_usb->handle);
+	libusb_close(ptp_usb->handle);
 }
 
-
-struct usb_bus*
-init_usb()
+int probe_device(struct libusb_dev* dev, int busn, int portn, short force, uint8_t* interface_number)
 {
-	usb_init();
-	usb_find_busses();
-	usb_find_devices();
-	return (usb_get_busses());
+	struct libusb_config_descriptor *config = NULL;
+
+	if(libusb_get_config_descriptor(dev, 0, &config) != 0) {
+		perror("libusb_get_config_descriptor");
+		exit(1);
+	}
+
+	for(int i = 0; i < config->bNumInterfaces; i++) {
+		if(config->interface[i].num_altsetting != 1)
+			continue;
+
+		const struct libusb_interface_descriptor *interface = &config->interface[i].altsetting[0];
+
+		if (interface->bInterfaceClass != USB_CLASS_PTP && !force)
+			continue;
+
+		if ((busn != 0) && libusb_get_bus_number(dev) != busn)
+			continue;
+
+		if ((portn != 0 ) && libusb_get_port_number(dev) != portn)
+			continue;
+
+		*interface_number = interface->bInterfaceNumber;
+		libusb_free_config_descriptor(config);
+		return 1;
+	}
+
+	libusb_free_config_descriptor(config);
+	return 0;
 }
 
 /*
-   find_device() returns the pointer to a usb_device structure matching
-   given busn, devicen numbers. If any or both of arguments are 0 then the
-   first matching PTP device structure is returned. 
+   find_device() returns the handle to an opened usb_device structure matching
+   given busn, portn numbers. If any or both of arguments are 0 then the
+   first matching PTP device handle is returned.
 */
-struct usb_device*
-find_device (int busn, int devicen, short force);
-struct usb_device*
-find_device (int busn, int devn, short force)
+struct libusb_device_handle*
+find_device (int busn, int portn, short force, uint8_t *interface_number);
+struct libusb_device_handle*
+find_device (int busn, int portn, short force, uint8_t *interface_number)
 {
-	struct usb_bus *bus;
-	struct usb_device *dev;
+	ssize_t cnt;
+	libusb_device **devs;
+    libusb_device_handle *handle;
 
-	bus=init_usb();
-	for (; bus; bus = bus->next)
-	for (dev = bus->devices; dev; dev = dev->next)
-	if (dev->config)
-	if ((dev->config->interface->altsetting->bInterfaceClass==
-		USB_CLASS_PTP)||force)
-	if (dev->descriptor.bDeviceClass!=USB_CLASS_HUB)
-	{
-		int curbusn, curdevn;
+	libusb_init(&usb_ctx);
+	libusb_set_option(&usb_ctx, LIBUSB_OPTION_LOG_LEVEL, 4);
+	cnt = libusb_get_device_list(usb_ctx, &devs);
 
-		curbusn=strtol(bus->dirname,NULL,10);
-#ifdef WIN32
-		curdevn=strtol(strchr(dev->filename,'-')+1,NULL,10);
-#else    
-		curdevn=strtol(dev->filename,NULL,10);
-#endif
+	for (int i = 0; i < cnt; i++) {
+		if (probe_device(devs[i], busn, portn, force, interface_number) == 0)
+			continue;
 
-		if (devn==0) {
-			if (busn==0) return dev;
-			if (curbusn==busn) return dev;
-		} else {
-			if ((busn==0)&&(curdevn==devn)) return dev;
-			if ((curbusn==busn)&&(curdevn==devn)) return dev;
-		}
+		// Keep a reference to the device we are about to return.
+		libusb_open(devs[i], &handle);
+		libusb_free_device_list(devs, 1);
+		return handle;
 	}
+
 	return NULL;
 }
 
 void
-find_endpoints(struct usb_device *dev, int* inep, int* outep, int* intep);
+find_endpoints(libusb_device* dev, int* inep, int* outep, int* intep);
 void
-find_endpoints(struct usb_device *dev, int* inep, int* outep, int* intep)
+find_endpoints(libusb_device* dev, int* inep, int* outep, int* intep)
 {
-	int i,n;
+	int n;
 	struct usb_endpoint_descriptor *ep;
+	struct libusb_config_descriptor *config = NULL;
 
-	ep = dev->config->interface->altsetting->endpoint;
-	n=dev->config->interface->altsetting->bNumEndpoints;
+	if(libusb_get_config_descriptor(dev, 0, &config) != 0) {
+		perror("libusb_get_config_descriptor");
+		exit(1);
+	}
 
-	for (i=0;i<n;i++) {
-	if (ep[i].bmAttributes==USB_ENDPOINT_TYPE_BULK)	{
-		if ((ep[i].bEndpointAddress&USB_ENDPOINT_DIR_MASK)==
-			USB_ENDPOINT_DIR_MASK)
-		{
-			*inep=ep[i].bEndpointAddress;
-			if (verbose>1)
-				fprintf(stderr, "Found inep: 0x%02x\n",*inep);
-		}
-		if ((ep[i].bEndpointAddress&USB_ENDPOINT_DIR_MASK)==0)
-		{
-			*outep=ep[i].bEndpointAddress;
-			if (verbose>1)
-				fprintf(stderr, "Found outep: 0x%02x\n",*outep);
-		}
-		} else if ((ep[i].bmAttributes==USB_ENDPOINT_TYPE_INTERRUPT) &&
-			((ep[i].bEndpointAddress&USB_ENDPOINT_DIR_MASK)==
-				USB_ENDPOINT_DIR_MASK))
-		{
-			*intep=ep[i].bEndpointAddress;
-			if (verbose>1)
-				fprintf(stderr, "Found intep: 0x%02x\n",*intep);
+	for(int i = 0; i < config->bNumInterfaces; i++) {
+		if(config->interface[i].num_altsetting != 1)
+			continue;
+
+		const struct libusb_interface_descriptor *interface = &config->interface[i].altsetting[0];
+
+		for (int j=0; j < interface->bNumEndpoints; j++) {
+			const struct libusb_endpoint_descriptor *ep = &interface->endpoint[j];
+
+			if (ep->bmAttributes == LIBUSB_ENDPOINT_TRANSFER_TYPE_BULK) {
+				if ((ep->bEndpointAddress & LIBUSB_ENDPOINT_DIR_MASK) == LIBUSB_ENDPOINT_IN) {
+					*inep=ep[i].bEndpointAddress;
+					if (verbose>1)
+						fprintf(stderr, "Found inep: 0x%02x\n",*inep);
+				}
+
+				if ((ep->bEndpointAddress & LIBUSB_ENDPOINT_DIR_MASK) == LIBUSB_ENDPOINT_OUT) {
+					*outep=ep[i].bEndpointAddress;
+					if (verbose>1)
+						fprintf(stderr, "Found outep: 0x%02x\n",*outep);
+				}
+			}
+			else if (
+				(ep->bmAttributes == LIBUSB_ENDPOINT_TRANSFER_TYPE_INTERRUPT) &&
+				((ep->bEndpointAddress & LIBUSB_ENDPOINT_DIR_MASK) == LIBUSB_ENDPOINT_IN)
+			) {
+				*intep=ep[i].bEndpointAddress;
+				if (verbose>1)
+					fprintf(stderr, "Found intep: 0x%02x\n",*intep);
+			}
 		}
 	}
+	libusb_free_config_descriptor(config);
 }
 
 int
-open_camera (int busn, int devn, short force, PTP_USB *ptp_usb, PTPParams *params, struct usb_device **dev)
+open_camera (int busn, int devn, short force, PTP_USB *ptp_usb, PTPParams *params, struct libusb_device_handle **handle)
 {
 	int retrycnt=0;
 	uint16_t ret=0;
@@ -474,8 +509,8 @@ open_camera (int busn, int devn, short force, PTP_USB *ptp_usb, PTPParams *param
 	
   // retry device find for a while (in case the user just powered it on or called restart)
 	while ((retrycnt++ < MAXCONNRETRIES) && !ret) {
-		*dev=find_device(busn,devn,force);
-		if (*dev!=NULL) 
+		*handle=find_device(busn,devn,force,&ptp_usb->interface_number);
+		if (*handle!=NULL)
 			ret=1;
 		else {
 			fprintf(stderr,"Could not find any device matching given bus/dev numbers, retrying in 1 s...\n");
@@ -484,43 +519,43 @@ open_camera (int busn, int devn, short force, PTP_USB *ptp_usb, PTPParams *param
 		}
 	}
 
-	if (*dev==NULL) {
+	if (*handle==NULL) {
 		fprintf(stderr,"could not find any device matching given "
 		"bus/dev numbers\n");
 		return -1;
 	}
-	find_endpoints(*dev,&ptp_usb->inep,&ptp_usb->outep,&ptp_usb->intep);
-    init_ptp_usb(params, ptp_usb, *dev);   
+	find_endpoints(*handle,&ptp_usb->inep,&ptp_usb->outep,&ptp_usb->intep);
+	init_ptp_usb(params, ptp_usb, *handle);
 
   // first connection attempt often fails if some other app or driver has accessed the camera, retry for a while
 	retrycnt=0;
 	while ((retrycnt++ < MAXCONNRETRIES) && ((ret=ptp_opensession(params,1))!=PTP_RC_OK)) {
 		printf("Failed to connect (attempt %d), retrying in 1 s...\n", retrycnt);
-		close_usb(ptp_usb, *dev);
+		close_usb(ptp_usb);
 		sleep(1);
-		find_endpoints(*dev,&ptp_usb->inep,&ptp_usb->outep,&ptp_usb->intep);
-		init_ptp_usb(params, ptp_usb, *dev);   
+		find_endpoints(*handle,&ptp_usb->inep,&ptp_usb->outep,&ptp_usb->intep);
+		init_ptp_usb(params, ptp_usb, *handle);
 	}  
 	if (ret != PTP_RC_OK) {
 		fprintf(stderr,"ERROR: Could not open session!\n");
-		close_usb(ptp_usb, *dev);
+		close_usb(ptp_usb);
 		return -1;
 	}
 
 	if (ptp_getdeviceinfo(params,&params->deviceinfo)!=PTP_RC_OK) {
 		fprintf(stderr,"ERROR: Could not get device info!\n");
-		close_usb(ptp_usb, *dev);
+		close_usb(ptp_usb);
 		return -1;
 	}
 	return 0;
 }
 
 void
-close_camera (PTP_USB *ptp_usb, PTPParams *params, struct usb_device *dev)
+close_camera (PTP_USB *ptp_usb, PTPParams *params, struct libusb_device_handle *handle)
 {
 	if (ptp_closesession(params)!=PTP_RC_OK)
 		fprintf(stderr,"ERROR: Could not close session!\n");
-	close_usb(ptp_usb, dev);
+	close_usb(ptp_usb);
 }
 
 
@@ -528,11 +563,53 @@ void
 list_devices(short force)
 {
 	struct usb_bus *bus;
-	struct usb_device *dev;
 	int found=0;
+	ssize_t cnt;
+	libusb_device **devs;
 
+	libusb_init(&usb_ctx);
+	libusb_set_option(&usb_ctx, LIBUSB_OPTION_LOG_LEVEL, 4);
 
-	bus=init_usb();
+	cnt = libusb_get_device_list(usb_ctx, &devs);
+
+	for (int i = 0; i < cnt; i ++) {
+		PTPParams params;
+		PTP_USB ptp_usb;
+		PTPDeviceInfo deviceinfo;
+		struct libusb_device_descriptor desc;
+		uint8_t device_port_numbers[7];
+		uint8_t device_path_length = 0;
+
+		if (probe_device(devs[i], 0, 0, force, &ptp_usb.interface_number) == 0)
+			continue;
+
+		if (!found){
+			printf("\nListing devices...\n");
+			printf("bus/dev\tvendorID/prodID\tdevice model\n");
+			found=1;
+		}
+
+		find_endpoints(devs[i], &ptp_usb.inep, &ptp_usb.outep, &ptp_usb.intep);
+		init_ptp_usb(&params, &ptp_usb, devs[i]);
+		libusb_get_device_descriptor(devs[i], &desc);
+		device_path_length = libusb_get_port_numbers(devs[i], device_port_numbers, 7);
+
+		for (int j = 0; j < device_path_length; j++) {
+			printf("%s%d", j ? ":":"", device_port_numbers[j]);
+		}
+		printf("\t0x%04X/0x%04X\t%s\n",
+			desc.idVendor, desc.idProduct,
+			/*deviceinfo.Model*/ "FIXME");
+
+		CC(ptp_opensession (&params,1),
+			"Could not open session!\n"
+			"Try to reset the camera.\n");
+		CC(ptp_closesession(&params),
+			"Could not close session!\n");
+
+		close_usb(&ptp_usb);
+	}
+#if 0
   	for (; bus; bus = bus->next)
     	for (dev = bus->devices; dev; dev = dev->next) {
 		/* if it's a PTP device try to talk to it */
@@ -545,16 +622,10 @@ list_devices(short force)
 			PTP_USB ptp_usb;
 			PTPDeviceInfo deviceinfo;
 
-			if (!found){
-				printf("\nListing devices...\n");
-				printf("bus/dev\tvendorID/prodID\tdevice model\n");
-				found=1;
-			}
-
 			find_endpoints(dev,&ptp_usb.inep,&ptp_usb.outep,
 				&ptp_usb.intep);
+			printf("found endpoints: in=%x, out=%x, int=%x\n", ptp_usb.inep, ptp_usb.outep, ptp_usb.intep);
 			init_ptp_usb(&params, &ptp_usb, dev);
-
 			CC(ptp_opensession (&params,1),
 				"Could not open session!\n"
 				"Try to reset the camera.\n");
@@ -568,9 +639,11 @@ list_devices(short force)
 
 			CC(ptp_closesession(&params),
 				"Could not close session!\n");
-			close_usb(&ptp_usb, dev);
+			close_usb(&ptp_usb);
 		}
 	}
+# endif
+
 	if (!found) printf("\nFound no PTP devices\n");
 	printf("\n");
 }
@@ -580,11 +653,11 @@ show_info (int busn, int devn, short force)
 {
 	PTPParams params;
 	PTP_USB ptp_usb;
-	struct usb_device *dev;
+	struct libusb_device_handle *handle;
 
 	printf("\nCamera information\n");
 	printf("==================\n");
-	if (open_camera(busn, devn, force, &ptp_usb, &params, &dev)<0)
+	if (open_camera(busn, devn, force, &ptp_usb, &params, &handle)<0)
 		return;
 	printf("Model: %s\n",params.deviceinfo.Model);
 	printf("  manufacturer: %s\n",params.deviceinfo.Manufacturer);
@@ -597,7 +670,7 @@ show_info (int busn, int devn, short force)
 	printf("  extension version: 0x%04x\n",
 				params.deviceinfo.VendorExtensionVersion);
 	printf("\n");
-	close_camera(&ptp_usb, &params, dev);
+	close_camera(&ptp_usb, &params, handle);
 }
 
 void
@@ -667,7 +740,7 @@ loop_capture (int busn, int devn, short force, int n,  int overwrite)
 	PTPParams params;
 	PTP_USB ptp_usb;
 	PTPContainer event;
-	struct usb_device *dev;
+	struct libusb_device_handle *dev;
 	int file;
 	PTPObjectInfo oi;
 	uint32_t handle=0;
@@ -957,7 +1030,7 @@ nikon_direct_capture2 (int busn, int devn, short force, char* filename, int over
 	uint16_t result;
 	PTPObjectInfo oi;
 
-	dev=find_device(busn,devn,force);
+	dev=find_device(busn,devn,force, &ptp_usb.interface_number);
 	if (dev==NULL) {
 		fprintf(stderr,"could not find any device matching given "
 		"bus/dev numbers\n");
@@ -969,7 +1042,7 @@ nikon_direct_capture2 (int busn, int devn, short force, char* filename, int over
 
 	if (ptp_opensession(&params,1)!=PTP_RC_OK) {
 		fprintf(stderr,"ERROR: Could not open session!\n");
-		close_usb(&ptp_usb, dev);
+		close_usb(&ptp_usb);
 		return ;
 	}
 /*
@@ -1000,7 +1073,7 @@ nikon_direct_capture2 (int busn, int devn, short force, char* filename, int over
 
 	if (ptp_opensession(&params,1)!=PTP_RC_OK) {
     		fprintf(stderr,"ERROR: Could not open session!\n");
-    		close_usb(&ptp_usb, dev);
+    		close_usb(&ptp_usb);
     		return;
     	}
 loop:
@@ -1876,39 +1949,26 @@ show_all_properties (int busn,int devn,short force, int unknown)
 int
 usb_get_endpoint_status(PTP_USB* ptp_usb, int ep, uint16_t* status)
 {
-	 return (usb_control_msg(ptp_usb->handle,
-		USB_DP_DTH|USB_RECIP_ENDPOINT, USB_REQ_GET_STATUS,
-		USB_FEATURE_HALT, ep, (char *)status, 2, 3000));
+	return (libusb_control_transfer(
+		ptp_usb->handle,
+		LIBUSB_ENDPOINT_IN|LIBUSB_RECIPIENT_ENDPOINT,
+		LIBUSB_REQUEST_GET_STATUS,
+		0, ep,
+		(char *)status, 2, 3000));
 }
 
-int
-usb_clear_stall_feature(PTP_USB* ptp_usb, int ep)
-{
-
-	return (usb_control_msg(ptp_usb->handle,
-		USB_RECIP_ENDPOINT, USB_REQ_CLEAR_FEATURE, USB_FEATURE_HALT,
-		ep, NULL, 0, 3000));
-}
 
 int
 usb_ptp_get_device_status(PTP_USB* ptp_usb, uint16_t* devstatus);
 int
 usb_ptp_get_device_status(PTP_USB* ptp_usb, uint16_t* devstatus)
 {
-	return (usb_control_msg(ptp_usb->handle,
-		USB_DP_DTH|USB_TYPE_CLASS|USB_RECIP_INTERFACE,
-		USB_REQ_GET_DEVICE_STATUS, 0, 0,
+	return (libusb_control_transfer(
+		ptp_usb->handle,
+		LIBUSB_ENDPOINT_IN|LIBUSB_REQUEST_TYPE_CLASS|LIBUSB_RECIPIENT_INTERFACE,
+		LIBUSB_REQUEST_GET_STATUS,
+		0, 0,
 		(char *)devstatus, 4, 3000));
-}
-
-int
-usb_ptp_device_reset(PTP_USB* ptp_usb);
-int
-usb_ptp_device_reset(PTP_USB* ptp_usb)
-{
-	return (usb_control_msg(ptp_usb->handle,
-		USB_TYPE_CLASS|USB_RECIP_INTERFACE,
-		USB_REQ_DEVICE_RESET, 0, 0, NULL, 0, 3000));
 }
 
 void
@@ -1918,7 +1978,7 @@ reset_device (int busn, int devn, short force)
 {
 	PTPParams params;
 	PTP_USB ptp_usb;
-	struct usb_device *dev;
+	struct libusb_device_handle *dev;
 	uint16_t status;
 	uint16_t devstatus[2] = {0,0};
 	int ret;
@@ -1926,7 +1986,7 @@ reset_device (int busn, int devn, short force)
 #ifdef DEBUG
 	printf("dev %i\tbus %i\n",devn,busn);
 #endif
-	dev=find_device(busn,devn,force);
+	dev=find_device(busn,devn,force,&ptp_usb.interface_number);
 	if (dev==NULL) {
 		fprintf(stderr,"could not find any device matching given "
 		"bus/dev numbers\n");
@@ -1945,8 +2005,8 @@ reset_device (int busn, int devn, short force)
 	/* and clear the HALT condition if happend*/
 	if (status) {
 		printf("Resetting input pipe!\n");
-		ret=usb_clear_stall_feature(&ptp_usb,ptp_usb.inep);
-		if (ret<0)perror ("usb_clear_stall_feature()");
+		ret=libusb_clear_halt(ptp_usb.handle,ptp_usb.inep);
+		if (ret<0)perror ("libusb_clear_halt()");
 	}
 	status=0;
 	/* check the out endpoint status*/
@@ -1955,8 +2015,8 @@ reset_device (int busn, int devn, short force)
 	/* and clear the HALT condition if happend*/
 	if (status) {
 		printf("Resetting output pipe!\n");
-		ret=usb_clear_stall_feature(&ptp_usb,ptp_usb.outep);
-		if (ret<0)perror ("usb_clear_stall_feature()");
+		ret=libusb_clear_halt(ptp_usb.handle,ptp_usb.inep);
+		if (ret<0)perror ("libusb_clear_halt()");
 	}
 	status=0;
 	/* check the interrupt endpoint status*/
@@ -1965,8 +2025,8 @@ reset_device (int busn, int devn, short force)
 	/* and clear the HALT condition if happend*/
 	if (status) {
 		printf ("Resetting interrupt pipe!\n");
-		ret=usb_clear_stall_feature(&ptp_usb,ptp_usb.intep);
-		if (ret<0)perror ("usb_clear_stall_feature()");
+		ret=libusb_clear_halt(ptp_usb.handle,ptp_usb.intep);
+		if (ret<0)perror ("libusb_clear_halt()");
 	}
 
 	/* get device status (now there should be some results)*/
@@ -1981,12 +2041,12 @@ reset_device (int busn, int devn, short force)
 	}
 	
 	/* finally reset the device (that clears prevoiusly opened sessions)*/
-	ret = usb_ptp_device_reset(&ptp_usb);
-	if (ret<0)perror ("usb_ptp_device_reset()");
+	ret = libusb_reset_device(ptp_usb.handle);
+	if (ret<0)perror ("libusb_reset_device()");
 	/* get device status (devices likes that regardless of its result)*/
 	usb_ptp_get_device_status(&ptp_usb,devstatus);
 
-	close_usb(&ptp_usb, dev);
+	close_usb(&ptp_usb);
 
 }
 
